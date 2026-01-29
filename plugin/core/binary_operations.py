@@ -79,6 +79,263 @@ class BinaryOperations:
             bn.log_error(f"Failed to load binary: {e}")
             raise
 
+    def _execute_on_main_thread(self, func) -> bool:
+        """Execute a function on the main Qt thread.
+
+        Binary Ninja UI operations must run on the main thread to avoid crashes.
+        This method tries multiple approaches for compatibility across versions.
+
+        Args:
+            func: Callable to execute on the main thread
+
+        Returns:
+            True if scheduling succeeded, False otherwise
+        """
+        # Try binaryninja.mainthread module (preferred method)
+        try:
+            from binaryninja import mainthread
+
+            if hasattr(mainthread, "execute_on_main_thread"):
+                mainthread.execute_on_main_thread(func)
+                return True
+        except (ImportError, AttributeError):
+            pass
+
+        # Try binaryninjaui.execute_on_main_thread
+        try:
+            import binaryninjaui as ui
+
+            if hasattr(ui, "execute_on_main_thread"):
+                ui.execute_on_main_thread(func)
+                return True
+        except (ImportError, AttributeError):
+            pass
+
+        # Try QTimer.singleShot as fallback
+        try:
+            from PySide6.QtCore import QTimer
+
+            QTimer.singleShot(0, func)
+            return True
+        except ImportError:
+            pass
+
+        # Last resort: direct call (may cause threading issues)
+        bn.log_warn("No main thread dispatch method available")
+        return False
+
+    def _open_binary_in_gui(self, file_path: str) -> tuple[bn.BinaryView | None, bool]:
+        """Open a binary file in the Binary Ninja GUI.
+
+        This method runs UI operations on the main Qt thread to ensure proper
+        window integration and avoid threading crashes.
+
+        Args:
+            file_path: Absolute path to the binary file
+
+        Returns:
+            Tuple of (BinaryView or None, success flag)
+
+        Raises:
+            ImportError: If binaryninjaui is not available (headless mode)
+        """
+        import threading
+        import time
+
+        import binaryninjaui as ui
+
+        result = {"bv": None, "success": False}
+        open_event = threading.Event()
+
+        def do_open():
+            try:
+                ctx = ui.UIContext.activeContext()
+                if ctx is not None and hasattr(ctx, "openFilename"):
+                    if ctx.openFilename(file_path):
+                        result["success"] = True
+            except Exception as e:
+                bn.log_warn(f"openFilename failed: {e}")
+            finally:
+                open_event.set()
+
+        # Open file on main thread
+        if not self._execute_on_main_thread(do_open):
+            do_open()  # Fallback to direct call
+        open_event.wait(timeout=30)
+
+        if not result["success"]:
+            return None, False
+
+        # Find the BinaryView for the opened file
+        for _ in range(100):  # Poll for up to 10 seconds
+            time.sleep(0.1)
+            find_event = threading.Event()
+            found = {"bv": None}
+
+            def do_find():
+                try:
+                    for ctx in ui.UIContext.allContexts():
+                        vf = ctx.getCurrentViewFrame()
+                        if vf and hasattr(vf, "getCurrentBinaryView"):
+                            candidate = vf.getCurrentBinaryView()
+                            if candidate:
+                                try:
+                                    if candidate.file.filename == file_path:
+                                        found["bv"] = candidate
+                                        return
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+                finally:
+                    find_event.set()
+
+            if not self._execute_on_main_thread(do_find):
+                do_find()
+            find_event.wait(timeout=1)
+
+            if found["bv"] is not None:
+                return found["bv"], True
+
+        # Fallback: try to get the current view
+        bn.log_warn("Could not find specific BinaryView, using current view")
+        current_event = threading.Event()
+        current = {"bv": None}
+
+        def get_current():
+            try:
+                ctx = ui.UIContext.activeContext()
+                if ctx:
+                    vf = ctx.getCurrentViewFrame()
+                    if vf and hasattr(vf, "getCurrentBinaryView"):
+                        current["bv"] = vf.getCurrentBinaryView()
+            except Exception:
+                pass
+            finally:
+                current_event.set()
+
+        if not self._execute_on_main_thread(get_current):
+            get_current()
+        current_event.wait(timeout=5)
+
+        return current["bv"], True
+
+    def add_binary(self, file_path: str, wait_for_analysis: bool = True) -> dict[str, Any]:
+        """Add a binary to Binary Ninja, creating a new view and triggering analysis.
+
+        When running in GUI mode, opens the file in the UI with proper window integration.
+        Falls back to headless loading when GUI is not available.
+
+        Args:
+            file_path: Path to the binary file to load (absolute or relative)
+            wait_for_analysis: If True, wait for initial analysis to complete before returning
+
+        Returns:
+            Dictionary with information about the loaded binary:
+            {
+                "status": "ok",
+                "id": "<view_id>",
+                "filename": "<full_path>",
+                "basename": "<filename>",
+                "analysis_complete": <bool>
+            }
+
+        Raises:
+            ValueError: If the file does not exist or cannot be loaded
+        """
+        import os
+
+        if not file_path:
+            raise ValueError("File path is required")
+
+        resolved_path = os.path.abspath(os.path.expanduser(file_path))
+        if not os.path.exists(resolved_path):
+            raise ValueError(f"File not found: {resolved_path}")
+        if not os.path.isfile(resolved_path):
+            raise ValueError(f"Path is not a file: {resolved_path}")
+
+        bn.log_info(f"Adding binary: {resolved_path}")
+
+        try:
+            bv = None
+            gui_opened = False
+
+            # Try GUI method first to ensure proper UI integration
+            # UI operations must run on the main Qt thread to avoid crashes
+            try:
+                bv, gui_opened = self._open_binary_in_gui(resolved_path)
+            except ImportError:
+                bn.log_info("GUI not available, using headless mode")
+            except Exception as e:
+                bn.log_warn(f"GUI method failed: {e}, falling back to headless")
+
+            # Fallback to headless methods if GUI didn't work
+            if bv is None and not gui_opened:
+                if hasattr(bn, "load"):
+                    bn.log_info("Using bn.load method (headless)")
+                    bv = bn.load(resolved_path)
+                elif hasattr(bn, "open_view"):
+                    bn.log_info("Using bn.open_view method")
+                    bv = bn.open_view(resolved_path)
+                elif hasattr(bn, "BinaryViewType") and hasattr(
+                    bn.BinaryViewType, "get_view_of_file"
+                ):
+                    bn.log_info("Using BinaryViewType.get_view_of_file method")
+                    file_metadata = bn.FileMetadata()
+                    try:
+                        if hasattr(bn.BinaryViewType, "get_default_options"):
+                            options = bn.BinaryViewType.get_default_options()
+                            bv = bn.BinaryViewType.get_view_of_file(
+                                resolved_path, file_metadata, options
+                            )
+                        else:
+                            bv = bn.BinaryViewType.get_view_of_file(resolved_path, file_metadata)
+                    except TypeError:
+                        bv = bn.BinaryViewType.get_view_of_file(resolved_path)
+                elif hasattr(bn, "BinaryViewType") and hasattr(
+                    bn.BinaryViewType, "get_view_of_file_with_options"
+                ):
+                    bn.log_info("Using legacy method")
+                    file_metadata = bn.FileMetadata()
+                    binary_view_type = bn.BinaryViewType.get_view_of_file_with_options(
+                        resolved_path, file_metadata
+                    )
+                    if binary_view_type:
+                        bv = binary_view_type.open()
+                else:
+                    raise ValueError(
+                        "Binary Ninja API does not support opening files programmatically"
+                    )
+
+            if bv is None:
+                raise ValueError(f"Failed to open binary: {resolved_path}")
+
+            # Register the view and set as current
+            view_id = self._register_view(bv)
+            self._current_view = bv
+
+            analysis_complete = False
+            if wait_for_analysis:
+                try:
+                    # Wait for initial analysis to complete
+                    bv.update_analysis_and_wait()
+                    analysis_complete = True
+                    bn.log_info(f"Analysis complete for: {resolved_path}")
+                except Exception as e:
+                    bn.log_warn(f"Analysis wait failed (continuing anyway): {e}")
+
+            return {
+                "status": "ok",
+                "id": view_id,
+                "filename": resolved_path,
+                "basename": os.path.basename(resolved_path),
+                "analysis_complete": analysis_complete,
+            }
+
+        except Exception as e:
+            bn.log_error(f"Failed to add binary: {e}")
+            raise ValueError(f"Failed to add binary: {e!s}")
+
     # ---------------- Multi-binary helpers ----------------
     def _prune_views(self) -> None:
         """Remove entries for BinaryViews that no longer exist and rebuild filename map."""
