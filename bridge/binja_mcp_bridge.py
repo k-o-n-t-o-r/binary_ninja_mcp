@@ -665,6 +665,9 @@ def add_binary(file_path: str, wait_for_analysis: bool = True) -> str:
     Add a binary to Binary Ninja, creating a new view and triggering automatic analysis.
     The binary will be opened, analyzed, and set as the active binary for subsequent operations.
 
+    If the binary is already loaded in Binary Ninja, it will be selected as the active
+    binary instead of being opened again.
+
     Args:
         file_path: Path to the binary file to load (absolute or relative path)
         wait_for_analysis: If True (default), wait for initial analysis to complete before returning.
@@ -687,8 +690,10 @@ def add_binary(file_path: str, wait_for_analysis: bool = True) -> str:
         selectors = data.get("selectors") or []
         selector_text = ", ".join(str(s) for s in selectors if s)
         display_name = basename or filename or "(unknown)"
+        already_loaded = data.get("already_loaded", False)
+        action = "Selected existing binary" if already_loaded else "Added binary"
         return (
-            f"Added binary: {display_name}\n"
+            f"{action}: {display_name}\n"
             f"View ID: {view_id}\n"
             f"Full path: {filename}\n"
             f"Analysis: {analysis}\n"
